@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# mmcv / mmdet3d install artifacts
+mmcv_full-*.whl
+mmdet3d/.mim/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Inference output
+ros_output/
