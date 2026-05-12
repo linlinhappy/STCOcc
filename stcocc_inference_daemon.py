@@ -53,6 +53,53 @@ NUM_CAMS = 6
 NUM_FRAMES = 3   # curr + 2 adjacent (stereo extra_ref)
 
 
+def _ego2global_to_can_bus(ego2global_4x4: np.ndarray) -> np.ndarray:
+    """Reproduce nuScenes 18-d can_bus vector from current ego→world matrix.
+
+    Layout (matches BEVFormer / STCOcc training pipeline):
+      [0:3]   global xyz
+      [3:7]   rotation quaternion (w, x, y, z)
+      [7:16]  accel(3) + rot_rate(3) + velocity(3) — zeros (unused at inference)
+      [16]    patch_angle in radians
+      [17]    patch_angle in degrees, normalized to [0, 360)
+    The detector overwrites [:3] and [-1] with per-frame deltas internally.
+    """
+    M = np.asarray(ego2global_4x4, dtype=np.float64)
+    tx, ty, tz = M[:3, 3]
+    R = M[:3, :3]
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        qw = (R[2, 1] - R[1, 2]) / s; qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s; qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        qw = (R[0, 2] - R[2, 0]) / s; qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s; qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        qw = (R[1, 0] - R[0, 1]) / s; qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s; qz = 0.25 * s
+
+    yaw_deg = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
+    if yaw_deg < 0.0:
+        yaw_deg += 360.0
+    yaw_rad = np.radians(yaw_deg)
+
+    can_bus = np.zeros(18, dtype=np.float32)
+    can_bus[0] = tx; can_bus[1] = ty; can_bus[2] = tz
+    can_bus[3] = qw; can_bus[4] = qx; can_bus[5] = qy; can_bus[6] = qz
+    can_bus[16] = yaw_rad
+    can_bus[17] = yaw_deg
+    return can_bus
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
@@ -78,7 +125,7 @@ def load_model(config_path: str, weights_path: str):
 # Single-frame inference
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def run_inference(model, npz_path: pathlib.Path) -> dict:
+def run_inference(model, npz_path: pathlib.Path, force_start_of_seq: bool = False) -> dict:
     t_load_start = time.perf_counter()
     data = np.load(str(npz_path), allow_pickle=False)
     t_load_end = time.perf_counter()
@@ -91,8 +138,18 @@ def run_inference(model, npz_path: pathlib.Path) -> dict:
     bda_np          = data['bda']                 # (4, 4)
     curr_to_prev_np = data['curr_to_prev_ego_rt'] # (4, 4)
     seq_idx         = int(data['sequence_group_idx'])
-    start_of_seq    = bool(data['start_of_sequence'])
+    start_of_seq    = bool(data['start_of_sequence']) or force_start_of_seq
     frame_ts        = float(data['frame_ts'])
+    # ego→world at the current frame (T=0; broadcast across cams)
+    ego2global_curr = ego2global_np[0, 0]
+
+    # lidar2img / ego2lidar for backward_projection.point_sampling.
+    # Reference frame "lidar" == ego (base_link); no BEV/img augmentation.
+    #   ego2lidar = I
+    #   lidar2img[i] = cam2img[i] @ inv(sensor2ego_curr[i])
+    sensor2ego_curr = sensor2ego_np[0].astype(np.float64)            # (N, 4, 4) at T=0
+    inv_s2e         = np.linalg.inv(sensor2ego_curr)
+    lidar2img_curr  = (cam2img_np.astype(np.float64) @ inv_s2e).astype(np.float32)  # (N,4,4)
 
     T, N = imgs_np.shape[:2]
     assert T == NUM_FRAMES and N == NUM_CAMS, f'Bad input shape: T={T}, N={N}'
@@ -121,10 +178,13 @@ def run_inference(model, npz_path: pathlib.Path) -> dict:
     img_metas = [{
         'sequence_group_idx': seq_idx,
         'start_of_sequence':  start_of_seq,
-        'curr_to_prev_ego_rt': curr_to_prev_np.astype(np.float64),
+        'curr_to_prev_ego_rt': curr_to_prev_np.astype(np.float32),
         'sample_idx': npz_path.stem,
         'scene_name': 'ros_bag',
         'index': 0,
+        'can_bus': _ego2global_to_can_bus(ego2global_curr),
+        'lidar2img': torch.from_numpy(lidar2img_curr),
+        'ego2lidar': torch.eye(4, dtype=torch.float32),
     }]
 
     t_forward_start = time.perf_counter()
@@ -184,6 +244,7 @@ def main():
 
     processed: set[str] = set()
     forward_times_ms: list[float] = []
+    first_frame_done = False
 
     def _shutdown(*_):
         if forward_times_ms:
@@ -212,7 +273,9 @@ def main():
 
             if latest.name not in processed:
                 try:
-                    result = run_inference(model, latest)
+                    result = run_inference(model, latest,
+                                           force_start_of_seq=not first_frame_done)
+                    first_frame_done = True
                     out_path = args.output_dir / latest.name
                     tmp_path = args.output_dir / (latest.name + '.tmp')
                     with open(tmp_path, 'wb') as f:
